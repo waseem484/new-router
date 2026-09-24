@@ -210,6 +210,7 @@ async def _observed_or_empty(
 
 @app.get("/catalog/search")
 async def catalog_search(q: str = "", limit: int = 25,
+                         under: float | None = None, category: str = "",
                          observations: endpoint_stats.EndpointObservationReader = Depends(
                              _endpoint_observation_reader)) -> dict:
     """Open: free-text search across the whole catalog — the DISCOVER half of the loop.
@@ -218,7 +219,13 @@ async def catalog_search(q: str = "", limit: int = 25,
     shelf hides it. Ranking is plain token matching (see `catalog_store.search`) so results are
     reproducible and explainable; equal scores — the common case, not the edge — then break on what
     treg has MEASURED and on price, so the cut stops being file order. `hints` carries the next
-    command, since finding the endpoint is never the goal — inspecting or calling it is."""
+    command, since finding the endpoint is never the goal — inspecting or calling it is.
+
+    `under` (USD per chargeable event) and `category` (a row's domain, capability, or its platform's
+    marketplace category / slug) are OPTIONAL filters applied after ranking, so the order the
+    evidence decided survives; rows they drop are reported in `filtered`, never silently. The CLI
+    sends them here; older servers simply ignore them, which is why the CLI falls back to filtering
+    its own page when a response comes back unfiltered."""
     cat = catalog_store.load()
     limit = max(1, min(limit, 100))
     # Rank a WIDER band than the page: collapsing a routed group (below) frees rows, and the next
@@ -234,6 +241,29 @@ async def catalog_search(q: str = "", limit: int = 25,
         | {"score": score, "observed": stats.get(ep["id"])}
         for ep, score in ranked
     ]
+    filtered = 0
+    if under is not None:
+        def _row_usd(view: dict) -> float | None:
+            cost = view.get("cost") or {}
+            shown = cost.get("display_usd")
+            if isinstance(shown, (int, float)) and not isinstance(shown, bool):
+                return float(shown)
+            usd = cost.get("usd")
+            return float(usd) if isinstance(usd, (int, float)) and not isinstance(usd, bool) else None
+        kept = [v for v in results if (u := _row_usd(v)) is not None and u < under]
+        filtered += len(results) - len(kept)
+        results = kept
+    if category.strip():
+        lowered = category.strip().lower()
+        def _in_category(view: dict) -> bool:
+            platform_meta = cat.platforms.get(view.get("platform") or "", {})
+            return (lowered in str(view.get("domain") or "").lower()
+                    or lowered in str(view.get("capability") or "").lower()
+                    or lowered in str(platform_meta.get("category") or "").lower()
+                    or lowered in str(view.get("platform") or "").lower())
+        kept = [v for v in results if _in_category(v)]
+        filtered += len(results) - len(kept)
+        results = kept
     results = catalog_store.group_routed(results, max_children=catalog_store.MAX_ROUTED_CHILDREN)[:limit]
     if not q.strip():
         hints = ["pass ?q= — e.g. /catalog/search?q=tiktok+comments"]
@@ -264,6 +294,8 @@ async def catalog_search(q: str = "", limit: int = 25,
             hints.append(f"{q!r} matches too broadly to rank on measured reliability past the first "
                          f"{catalog_store.RERANK_BAND} equally-scoring rows — add a word to narrow it")
     out = {"query": q, "count": len(results), "total": total, "results": results, "hints": hints}
+    if filtered:
+        out["filtered"] = filtered
     if not results and q.strip():
         # the rows that JUST missed the admission gate and which words they missed — an agent (or
         # the CLI display) turns this straight into the corrected query

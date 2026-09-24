@@ -311,11 +311,14 @@ def _load_json_arg(s: str, label: str):
         sys.exit(f"--{label} is not valid JSON: {exc}")
 
 
-def _show(resp: httpx.Response) -> None:
+def _show(resp: httpx.Response, _format: str | None = None) -> None:
     body = None
     try:
         body = resp.json()
-        print(json.dumps(body, indent=2))
+        if resp.status_code < 400 and _format:
+            _format_response_body(resp, _format)
+        else:
+            print(json.dumps(body, indent=2))
     except Exception:
         print(resp.text)
     if resp.status_code < 400:
@@ -2487,7 +2490,218 @@ def _print_raw_response(response: httpx.Response) -> None:
     sys.stdout.flush()
 
 
-def _show_call_response(response: httpx.Response) -> None:
+# ---- `treg call --dry-run` -------------------------------------------------------------------
+
+def _dry_usd(amount: float) -> str:
+    """One USD figure, 3 significant digits — same convention as `_cost_usd` for search tables."""
+    return f"${amount:.3g}"
+
+
+def _endpoint_usd_cost(ep: dict) -> float | None:
+    """The per-call USD figure a dry-run quotes: `display_usd` when set (the chargeable event —
+    the same choice `advertised_usd` makes), else `usd`. The caller may hold the provider's own
+    key, in which case nothing is billed to the balance — the printout says so separately."""
+    cost = ep.get("cost") or {}
+    shown = cost.get("display_usd")
+    if isinstance(shown, (int, float)) and not isinstance(shown, bool):
+        return float(shown)
+    usd = cost.get("usd")
+    return float(usd) if isinstance(usd, (int, float)) and not isinstance(usd, bool) else None
+
+
+def _dry_run_flattened_params(inp: dict) -> list[tuple[str, dict, str]]:
+    """`catalog get`'s dotted-leaf param walk, labelled by location — shared by the param table
+    and the missing-required check."""
+    flat: list[tuple[str, dict, str]] = []
+
+    def walk(items: dict, prefix: str, where: str) -> None:
+        for name, spec in items.items():
+            spec = spec if isinstance(spec, dict) else {}
+            props = spec.get("properties")
+            if isinstance(props, dict) and props:
+                walk(props, f"{prefix}{name}.", where)
+            else:
+                flat.append((f"{prefix}{name}", spec, where))
+
+    for where, params in (("path", inp.get("pathParams")), ("query", inp.get("queryParams")),
+                          ("body", inp.get("body"))):
+        if isinstance(params, dict) and params:
+            walk(params, "", where)
+    return flat
+
+
+def _call_dry_run(args, cfg, *, target: str, method: str, params: list[tuple[str, str]],
+                  content: bytes | None) -> None:
+    """Price and validate a catalog call WITHOUT sending it. Public catalog data, read signed-out
+    (the same way `catalog get` is); unknown ids and non-catalog targets fall through to the
+    detail route's own 404. Nothing is reserved, nothing is charged, nothing reaches an upstream."""
+    endpoint_id = target.split("/")[0]
+    if "://" in target:
+        sys.exit("--dry-run works with a catalog endpoint id (e.g. treg call hunter.people.email.find "
+                 "--dry-run); a raw URL has no catalog price to quote")
+    with _client(cfg, auth=False) as c:
+        r = c.get(f"/catalog/endpoints/{quote(endpoint_id, safe='')}")
+    if r.status_code != 200:
+        _show(r)
+        return
+    body = r.json()
+    e = body["endpoint"]
+    cost = e.get("cost") or {}
+    sent_keys = {k for k, _ in params}
+    sent_names = {name for name, _spec, _where
+                  in _dry_run_flattened_params({"body": _sent_body_keys(content)}) if name}
+
+    print(f"{(_B + 'DRY RUN' + _R)}  {e['id']}   {method} {e.get('path', '')}")
+    if e.get("summary"):
+        print(f"  {e['summary']}")
+
+    usd = _endpoint_usd_cost(e)
+    billed = "free" if cost.get("type") == "free" and not usd else (_dry_usd(usd) if usd is not None else None)
+    if billed:
+        unit = {"per_call": "call", "per_result": "result", "per_success": "success"}.get(cost.get("type"), "call")
+        floor = cost.get("usd_min")
+        line = f"  {_M}estimated cost{_R}  {billed}/{unit}"
+        if isinstance(floor, (int, float)) and floor < (usd or 0):
+            line += f"   (range {_dry_usd(floor)}–{billed})"
+        native = _native_amount(cost.get("value"), cost.get("currency", "USD")) \
+            if cost.get("currency", "USD") != "USD" and cost.get("value") is not None and usd is not None else ""
+        if native:
+            line += f"   ({native})"
+        print(line)
+        print(f"  {_M}billed to{_R}        your team's prepaid balance — `treg balance` shows it left; "
+              f"a provider key of your own (`treg connections connect`) makes this free of the balance")
+    else:
+        print(f"  {_M}estimated cost{_R}  unknown — this route is refused unless your team holds its "
+              f"own provider key (`treg connections connect`)")
+
+    inp = e.get("input") or {}
+    flat = _dry_run_flattened_params(inp)
+    if flat:
+        def _sent(name: str) -> bool:
+            return name in sent_keys or any(name == b or name.startswith(b + ".") for b in sent_names)
+        required = [kv for kv in flat if kv[1].get("required")]
+        missing = [name for name, _where, in_ in required if not _sent(name) and in_ != "path"]
+        print(f"\n  {_M}params{_R}            ({len(required)} required of {len(flat)}; ✓ = you already sent it)")
+        print(f"  {'':<20} {'IN':<6} {'NAME':<28} {'REQ':<4} VALUE")
+        for name, spec, where in sorted(flat, key=lambda kv: (not kv[1].get("required"), kv[0])):
+            mark = f"{_G}✓{_R}" if _sent(name) else " "
+            shown = _clip(str(spec.get("example") if spec.get("example") not in (None, "") else spec.get("type") or ""), 40)
+            print(f"  {mark:<20} {where:<6} {name:<28} {'yes' if spec.get('required') else '':<4} {shown}")
+        if missing:
+            print(f"\n  {_AM}missing required params ({len(missing)}):{_R} {', '.join(missing)}")
+            print(f"  {_AM}the call would be refused (422) — add them with --query / --data before spending{_R}")
+        else:
+            print(f"\n  {_G}all required params present{_R}")
+    elif inp.get("note"):
+        print(f"\n  {_M}params{_R}            {inp['note']}")
+
+    if e.get("kind") == "routed":
+        kids = e.get("routed_children") or []
+        if kids:
+            print(f"\n  {_M}routed{_R}            treg picks among {len(kids)} providers (own keys first, "
+                  f"then cheapest per hit); the served one is named on the response")
+
+    example = body.get("example_response")
+    if example is not None:
+        text = json.dumps(example, indent=2, ensure_ascii=False).splitlines()
+        shown_lines = text[:20]
+        print(f"\n  {_M}example response{_R}  (first {len(shown_lines)} of {len(text)} lines; "
+              f"full: treg catalog get {e['id']})")
+        for line in shown_lines:
+            print("  " + (line if len(line) <= 110 else line[:109] + "…"))
+
+    print(f"\n  {_M}nothing was sent, nothing was charged.{_R} Send it for real: treg call {target}")
+
+
+def _sent_body_keys(content: bytes | None) -> dict:
+    """`--data '{\"a\":1}'` declares body params by their JSON keys; anything else is opaque here."""
+    if not content:
+        return {}
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# ---- `treg call --format` ---------------------------------------------------------------------
+
+def _format_response_body(response: httpx.Response, fmt: str) -> None:
+    """Reshape a successful JSON body; anything else (binary, errors, non-JSON) passes
+    through verbatim; a formatter never stands between the caller and its exact bytes."""
+    if response.status_code >= 400 or fmt == "json":
+        _print_raw_response(response)
+        return
+    try:
+        body = response.json()
+    except ValueError:
+        _print_raw_response(response)
+        return
+    if isinstance(body, list):
+        body = {"items": body}
+    if not isinstance(body, dict):
+        _print_raw_response(response)
+        return
+    # A bare list already became {"items": [...]}; a single row renders as its one-key form.
+    arrays = [(k, v) for k, v in body.items() if isinstance(v, list) and v
+              and all(isinstance(row, dict) for row in v)]
+    if arrays:
+        key, rows = max(arrays, key=lambda kv: len(kv[1]))
+        _print_markdown_table(rows)
+        meta = {k: v for k, v in body.items() if k != key and not isinstance(v, (list, dict))}
+        for k, v in meta.items():
+            print(f"\n{k}: {v}")
+        return
+    _print_markdown_object(body)
+
+
+def _md_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text = str(value)
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _print_markdown_table(rows: list[dict]) -> None:
+    """A GitHub markdown table over the union of the rows' keys — pipe-friendly for both humans
+    and agents: every renderer agrees on it, and token count drops versus indented JSON."""
+    columns: list[str] = []
+    for row in rows:
+        for k in row:
+            if k not in columns:
+                columns.append(k)
+    if not columns:
+        _print_markdown_object({"rows": len(rows)})
+        return
+    print("| " + " | ".join(columns) + " |")
+    print("|" + "|".join(" --- " for _ in columns) + "|")
+    for row in rows:
+        print("| " + " | ".join(_md_cell(row.get(c)) for c in columns) + " |")
+
+
+def _print_markdown_object(body: dict) -> None:
+    for k, v in body.items():
+        if isinstance(v, (dict, list)):
+            print(f"**{k}:**")
+            if isinstance(v, list):
+                if v and all(isinstance(row, dict) for row in v):
+                    _print_markdown_table(v)
+                else:
+                    print("```json")
+                    print(json.dumps(v, indent=2, ensure_ascii=False))
+                    print("```")
+            elif isinstance(v, dict):
+                _print_markdown_table([v])
+        else:
+            print(f"**{k}:** {_md_cell(v)}")
+
+
+def _show_call_response(response: httpx.Response, _format: str | None = None) -> None:
     content_type = getattr(response, "headers", {}).get("content-type", "").partition(";")[0].strip().lower()
     if content_type and content_type != "application/json" and not content_type.endswith("+json") \
             and not content_type.startswith("text/"):
@@ -2499,7 +2713,10 @@ def _show_call_response(response: httpx.Response) -> None:
         _show_charge_line(response)
         _show_hint_line(response)
         return
-    _show(response)
+    if response.status_code < 400 and _format:
+        _format_response_body(response, _format)
+    else:
+        _show(response)
 
 
 def cmd_call(args, cfg) -> None:
@@ -2574,10 +2791,13 @@ def cmd_call(args, cfg) -> None:
     # curl's convention: a body implies POST. Catalog endpoints reject a method mismatch, so making
     # `treg call <id> --data …` just work beats asking the caller to repeat what the catalog knows.
     method = args.method or ("POST" if content is not None else "GET")
+    if getattr(args, "dry_run", False):
+        _call_dry_run(args, cfg, target=rest, method=method, params=params, content=content)
+        return
     with _client(cfg) as c:
         submission = c.request(method, f"/call/{rest}", params=params, content=content, headers=headers)
         if not getattr(args, "await_task", False) or not submission.headers.get("X-Treg-Async"):
-            _show_call_response(submission)
+            _show_call_response(submission, _format=getattr(args, "format", None))
             return
         if submission.status_code >= 400:
             _show(submission)
@@ -5005,10 +5225,23 @@ def _clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
+def _search_row_usd(e: dict) -> float | None:
+    """The row's USD-per-chargeable-event figure, for `--under`: the same `display_usd`-else-`usd`
+    choice the dry-run quote makes, so a filter and a quote can never disagree about a price."""
+    cost = e.get("cost") or {}
+    shown = cost.get("display_usd")
+    if isinstance(shown, (int, float)) and not isinstance(shown, bool):
+        return float(shown)
+    usd = cost.get("usd")
+    return float(usd) if isinstance(usd, (int, float)) and not isinstance(usd, bool) else None
+
+
 def _catalog_search(query: str, args, cfg) -> None:
     """Ranked free-text search over every endpoint — the way in when you know the job, not the shelf."""
     if not query.strip():
         sys.exit("search for what? e.g. treg catalog search tiktok comments")
+    under = getattr(args, "under", None)
+    category = (getattr(args, "category", None) or "").strip()
     with _client(cfg, auth=False) as c:
         r = c.get("/catalog/search", params={"q": query, "limit": getattr(args, "limit", 25) or 25})
     if r.status_code != 200 or _JSON_OVERRIDE:
@@ -5016,6 +5249,30 @@ def _catalog_search(query: str, args, cfg) -> None:
         return
     body = r.json()
     rows = body.get("results", [])
+    # Client-side filters, applied AFTER ranking so the order stays the server's — an agent gets
+    # the same ranked answer, just without rows it asked to exclude. Filtered-out counts are said
+    # out loud: a silently shorter page reads as the whole answer.
+    if under is not None:
+        priced = [e for e in rows if (u := _search_row_usd(e)) is not None and u < under]
+        dropped = len(rows) - len(priced)
+        rows = priced
+        if dropped:
+            _dim(f"{dropped} rows priced at or above ${under:g} (or unpriced) dropped — --under {under:g}")
+    if category:
+        # One word, several vocabularies: the row's own `domain` (video, backlinks, keywords),
+        # the platform's marketplace category (SEO/AEO, Social, …) or its platform slug. Case- and
+        # prefix-insensitive on purpose — an agent writes "back", a human writes "Backlinks".
+        plat_meta = body.get("platform") or {}
+        lowered = category.lower()
+        rows = [e for e in rows if lowered in str(e.get("domain") or "").lower()
+                or lowered in str(e.get("capability") or "").lower()
+                or lowered in str(e.get("platform") or "").lower()
+                or lowered in str(plat_meta.get("category") or "").lower()
+                or lowered in str(plat_meta.get("slug") or "").lower()]
+        if not rows:
+            _dim(f"no rows in category {category!r} within this search — try the exact section name "
+                 f"from `treg catalog <platform>` (e.g. video, backlinks, keywords)")
+            return
     if not rows:
         print(f"nothing matches \"{query}\"")
         for n in (body.get("near") or [])[:3]:
@@ -5024,6 +5281,10 @@ def _catalog_search(query: str, args, cfg) -> None:
         _dim("try different task words, or browse the shelves with `treg catalog`")
         _dim(f"still missing? file it: treg catalog request \"{query}\"   # requests steer what gets added next")
         return
+    # The server counts what ITS pass dropped (newer servers filter too; this client pass is the
+    # backstop for older ones). Never silent: a shorter page must say why it is shorter.
+    if body.get("filtered"):
+        _dim(f"{body['filtered']} rows dropped by --under/--category filters")
 
     idw = min(max(len(e["id"]) for e in rows), 46)
     print(f"\n{body['total']} matches for \"{query}\""
@@ -5973,6 +6234,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="wait for an async catalog call to reach a terminal state")
     cl.add_argument("--timeout", type=float, default=900,
                     help="maximum seconds to wait with --await (default: 900)")
+    cl.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="catalog endpoints: print the estimated cost, the required/optional params "
+                         "(flagging what you already sent) and a captured example response, then stop. "
+                         "No request is sent, nothing is charged")
+    cl.add_argument("--format", choices=["json", "markdown"], metavar="FMT",
+                    help="reshape a JSON response body on stdout: json = indented, markdown = a table "
+                         "for lists of objects (fewer tokens, easier to read). Errors pass through raw")
     cl.set_defaults(fn=cmd_call)
 
     # ---- audit (one log over both halves; `calls`/`runs` live on as hidden aliases) ----
@@ -6320,6 +6588,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "`request <what's missing>`")
     ct.add_argument("rest", nargs="*", metavar="<args>", help="the search query, endpoint id, or request text")
     ct.add_argument("--limit", type=int, default=25, help="search: how many results (default: 25, max 100)")
+    ct.add_argument("--under", metavar="USD", type=float,
+                    help="search: keep only endpoints priced under this many USD per call/result, e.g. --under 0.02")
+    ct.add_argument("--category", metavar="NAME",
+                    help="search: keep rows of one domain/category — the section a platform page groups by "
+                         "(e.g. video, backlinks, keywords) or a marketplace category (SEO/AEO, Social, …)")
     ct.add_argument("--all", action="store_true", dest="show_all",
                     help="include management endpoints (account/utility CRUD) hidden from the browse by default")
     ct.set_defaults(fn=cmd_catalog)

@@ -134,9 +134,11 @@ treg tool add google-ads --base-url https://googleads.googleapis.com \
 
 | Command | Options | What it does |
 |---|---|---|
-| `treg catalog search` | `"what you want to do"` | find endpoints by capability |
+| `treg catalog search` | `"what you want to do"`, `--under USD`, `--category NAME` | find endpoints by capability; `--under 0.02` keeps only cheaper ones, `--category video` keeps one section (row domain, capability, or platform category) |
 | `treg catalog get` | `ENDPOINT_ID` | docs, parameters, **the price**, and how you would be served |
 | `treg call ENDPOINT_ID` | `--query K=V`, `--data STR` | call it |
+| `treg call ENDPOINT_ID --dry-run` | — | print the estimated cost, the param table (✓ = already sent, missing required flagged) and a captured example response. **Nothing is sent, nothing is charged** — budget before you spend |
+| `treg call ENDPOINT_ID --format markdown` | `--format json` (default raw) | reshape a JSON response body: a list of objects becomes a markdown table (fewer tokens, easier to read). Errors and non-JSON bodies pass through untouched |
 | `treg call ENDPOINT_ID --await` | `--timeout N` (default 900) | a generation call (video/image): submit, poll the provider, print the final response |
 | `treg host FILE` | `--content-type T`, `--json` | host a reference image/audio/video at a public URL a vendor can fetch (30 MB, 7-day TTL, free); prints the URL for `image_urls` / `audio_urls` |
 | `treg catalog request` | `"what's missing"` | searched, not there? file it — requests steer what gets added next |
@@ -144,8 +146,11 @@ treg tool add google-ads --base-url https://googleads.googleapis.com \
 
 ```bash
 treg catalog search "instagram profile"
+treg catalog search "backlinks" --under 0.02 --category backlinks   # cheap backlink checkers only
 treg catalog get tikhub.tiktok.user.profile          # shows the price BEFORE you spend
+treg call tikhub.tiktok.user.profile --dry-run       # the price + the params you still owe, for free
 treg call tikhub.tiktok.user.profile --query uniqueId=tiktok
+treg call tavily.web.search --format markdown --query query=test   # a table instead of a JSON wall
 ```
 
 **Video and image generation** (`video-gen` / `image-gen` platforms) are async tasks: the call returns
@@ -261,6 +266,7 @@ stops at the first miss. `X-Treg-Route-Prefer` / `X-Treg-Route-Exclude` name pro
 | Command | Options | What it does |
 |---|---|---|
 | `treg call TOOL PATH` | `--method GET`, `--query K=V` (repeatable), `--data STR`, `--file PATH` | proxy a call (named form) |
+| `treg call TOOL PATH --format markdown` | `--format json` | reshape a successful JSON body into a markdown table (or indented JSON); errors and non-JSON pass through verbatim |
 | `treg calls` | `--limit N` | audit log (who called which tool, when, status) |
 
 ```bash
